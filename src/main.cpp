@@ -15,12 +15,17 @@
 #include <Geode/ui/BasedButtonSprite.hpp>
 #include <Geode/utils/string.hpp>
 #include <matjson.hpp>
-#include <thread>
 #include <unordered_set>
-#include <windows.h>
-#include <winhttp.h>
 #include <unordered_map>
 #include <algorithm>
+
+#if defined(GEODE_IS_WINDOWS)
+    #include <thread>
+    #include <windows.h>
+    #include <winhttp.h>
+#else
+    #include <Geode/utils/web.hpp>
+#endif
 
 using namespace geode::prelude;
 
@@ -37,9 +42,53 @@ static std::vector<ChallengeItem> g_classicItems;
 static std::vector<ChallengeItem> g_platformerItems;
 static bool g_showPlatformer = false;
 
-// ---------------- 네트워킹 (Supabase) ----------------
-static const wchar_t* SUPABASE_HOST = L"erpdomfrjxblrmapoceb.supabase.co";
-static const wchar_t* SUPABASE_APIKEY = L"sb_publishable_v44QyS3zcgDfpSSavZ3CAw_JuKL2Jfi";
+// ---------------- 공통: 받아온 JSON 파싱 ----------------
+static void parseChallengeList(std::string const& json) {
+    auto parsed = matjson::parse(json);
+    if (parsed.isErr()) return;
+
+    auto arr = parsed.unwrap();
+    if (!arr.isArray()) return;
+
+    auto arrResult = arr.asArray();
+    if (arrResult.isErr()) return;
+
+    std::vector<ChallengeItem> classicItems;
+    std::vector<ChallengeItem> platformerItems;
+
+    for (auto const& entry : arrResult.unwrap()) {
+        ChallengeItem item;
+        item.type = entry["type"].asString().unwrapOr("");
+        item.name = entry["name"].asString().unwrapOr("");
+        item.creator = entry["creator"].asString().unwrapOr("");
+        item.position = entry["position"].asInt().unwrapOr(0);
+
+        auto levelIdStr = entry["level_id"].asString().unwrapOr("0");
+        item.levelId = std::atoi(levelIdStr.c_str());
+
+        if (item.type == "classic") {
+            classicItems.push_back(item);
+        } else if (item.type == "platformer") {
+            platformerItems.push_back(item);
+        }
+    }
+
+    auto sortByPosition = [](ChallengeItem const& a, ChallengeItem const& b) {
+        return a.position < b.position;
+    };
+    std::sort(classicItems.begin(), classicItems.end(), sortByPosition);
+    std::sort(platformerItems.begin(), platformerItems.end(), sortByPosition);
+
+    g_classicItems = std::move(classicItems);
+    g_platformerItems = std::move(platformerItems);
+}
+
+// ---------------- 네트워킹 (플랫폼별 분기) ----------------
+static const std::string SUPABASE_HOST = "erpdomfrjxblrmapoceb.supabase.co";
+static const std::string SUPABASE_APIKEY = "sb_publishable_v44QyS3zcgDfpSSavZ3CAw_JuKL2Jfi";
+
+#if defined(GEODE_IS_WINDOWS)
+// ---- Windows: WinHTTP 직접 사용 (검증된 안정적인 방식) ----
 
 static std::string httpsGet(std::wstring const& host, std::wstring const& path, std::wstring const& apiKey) {
     std::string result;
@@ -89,56 +138,45 @@ static std::string httpsGet(std::wstring const& host, std::wstring const& path, 
     return result;
 }
 
-static void parseChallengeList(std::string const& json) {
-    auto parsed = matjson::parse(json);
-    if (parsed.isErr()) return;
-
-    auto arr = parsed.unwrap();
-    if (!arr.isArray()) return;
-
-    auto arrResult = arr.asArray();
-    if (arrResult.isErr()) return;
-
-    std::vector<ChallengeItem> classicItems;
-    std::vector<ChallengeItem> platformerItems;
-
-    for (auto const& entry : arrResult.unwrap()) {
-        ChallengeItem item;
-        item.type = entry["type"].asString().unwrapOr("");
-        item.name = entry["name"].asString().unwrapOr("");
-        item.creator = entry["creator"].asString().unwrapOr("");
-        item.position = entry["position"].asInt().unwrapOr(0);
-
-        auto levelIdStr = entry["level_id"].asString().unwrapOr("0");
-        item.levelId = std::atoi(levelIdStr.c_str());
-
-        if (item.type == "classic") {
-            classicItems.push_back(item);
-        } else if (item.type == "platformer") {
-            platformerItems.push_back(item);
-        }
-    }
-
-    auto sortByPosition = [](ChallengeItem const& a, ChallengeItem const& b) {
-        return a.position < b.position;
-    };
-    std::sort(classicItems.begin(), classicItems.end(), sortByPosition);
-    std::sort(platformerItems.begin(), platformerItems.end(), sortByPosition);
-
-    g_classicItems = std::move(classicItems);
-    g_platformerItems = std::move(platformerItems);
-}
-
 static void fetchChallengeList() {
     std::thread([]() {
+        std::wstring host(SUPABASE_HOST.begin(), SUPABASE_HOST.end());
+        std::wstring apiKey(SUPABASE_APIKEY.begin(), SUPABASE_APIKEY.end());
         std::wstring path = L"/rest/v1/maps?select=*&order=type.asc,position.asc&limit=100";
-        std::string json = httpsGet(SUPABASE_HOST, path, SUPABASE_APIKEY);
+
+        std::string json = httpsGet(host, path, apiKey);
 
         Loader::get()->queueInMainThread([json]() {
             parseChallengeList(json);
         });
     }).detach();
 }
+
+#else
+// ---- Android / macOS / iOS: Geode 공식 web API 사용 ----
+// (이 플랫폼들은 clang 기반 툴체인으로 빌드되므로, Windows 로컬 MSVC에서
+//  겪었던 코루틴 관련 컴파일러 크래시 문제가 적용되지 않습니다)
+
+static async::TaskHolder<web::WebResponse> g_fetchHolder;
+
+static void fetchChallengeList() {
+    auto url = "https://" + SUPABASE_HOST + "/rest/v1/maps?select=*&order=type.asc,position.asc&limit=100";
+
+    auto req = web::WebRequest();
+    req.header("apikey", SUPABASE_APIKEY);
+
+    g_fetchHolder.spawn(
+        "JawvCL: 챌린지 리스트 로딩",
+        req.get(url),
+        [](web::WebResponse response) {
+            if (response.ok()) {
+                parseChallengeList(response.string().unwrapOr(""));
+            }
+        }
+    );
+}
+
+#endif
 
 // ---------------- 전체 화면 챌린지 리스트 레이어 ----------------
 class ChallengeListLayer : public CCLayer, public LevelManagerDelegate, public LevelDownloadDelegate {
