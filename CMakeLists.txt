@@ -26,4 +26,6 @@ add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
 # Set up dependencies, resources, and link Geode.
 setup_geode_mod(${PROJECT_NAME})
-target_link_libraries(${PROJECT_NAME} winhttp)
+if (WIN32)
+    target_link_libraries(${PROJECT_NAME} winhttp)
+endif()
